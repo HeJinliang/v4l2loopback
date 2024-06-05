@@ -843,6 +843,7 @@ done:
 	return result;
 }
 
+// 存储 视频格式设置参数 eg: YU12:1920x1080@25/1  "YU12"被解析后存于 fourcc，1920->width, 1080->height, 25->fps_num, 1->fps_denom
 typedef struct _caps {
 	unsigned int fourcc;
 	int width, height;
@@ -950,12 +951,21 @@ done:
 	printf("%d/%d\n", num, denom);
 	return ret;
 }
+
+/**
+ * 用于解析视频参数字符串并据此设置给定视频设备的格式和其他相关属性
+ * 用法：v4l2loopback-ctl set-caps /dev/video0 "UYVY:640x480"
+ * @param devicename    设备名称 (devicename)
+ * @param capsstring    参数字符串 (capsstring)
+ * @return
+ */
 static int set_caps(const char *devicename, const char *capsstring)
 {
 	int result = 1;
+    // 打开视频设备以进行读写操作，文件描述符保存在 fd。
 	int fd = open_videodevice(devicename, O_RDWR);
-	struct v4l2_format vid_format;
-	struct v4l2_capability vid_caps;
+	struct v4l2_format vid_format;  // v4l2 格式
+	struct v4l2_capability vid_caps;    // v4l2 设备能力
 	t_caps caps;
 
 	/* now open up the device */
@@ -963,8 +973,10 @@ static int set_caps(const char *devicename, const char *capsstring)
 		goto done;
 
 	if (!strncmp("any", capsstring, 4)) {
+        // 如果参数字符串是 "any"，则跳过解析。
 		/* skip caps-parsing */
 	} else if (!strncmp("video/", capsstring, 6)) {
+        // 如果参数字符串以 "video/" 开始，打印错误信息并跳到函数末尾，因为不支持这种格式。
 		dprintf(2,
 			"ERROR: GStreamer-style caps are no longer supported!\n");
 		dprintf(2,
@@ -973,12 +985,14 @@ static int set_caps(const char *devicename, const char *capsstring)
 			"       e.g. 'UYVY:640x480@30/1' or 'RGBA:1024x768'\n");
 		goto done;
 	} else if (parse_caps(capsstring, &caps)) {
+        // 尝试解析参数字符串。如果失败，打印错误并跳到末尾。
 		dprintf(2, "unable to parse format '%s'\n", capsstring);
 		goto done;
 	}
 	//print_caps(&caps);
 
 	/* check whether this is actually a video-device */
+    // 使用 ioctl 检查视频设备能力。如果失败，打印错误并跳到末尾。
 	if (ioctl(fd, VIDIOC_QUERYCAP, &vid_caps) == -1) {
 		perror("VIDIOC_QUERYCAP");
 		goto done;
@@ -992,14 +1006,18 @@ static int set_caps(const char *devicename, const char *capsstring)
 	}
 
 	/* try to get the default values for the format first */
+    // 初始化视频格式结构体
 	memset(&vid_format, 0, sizeof(vid_format));
 
+    // 设置视频缓冲区类型为输出。
 	vid_format.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+    // 使用 ioctl 获取当前视频格式。如果失败，打印错误。
 	if (ioctl(fd, VIDIOC_G_FMT, &vid_format) == -1) {
 		perror("VIDIOC_G_FMT");
 	}
 
 	/* and set those caps that we have */
+    // 根据解析的参数设置视频格式的宽、高和像素格式。
 	if (caps.width)
 		vid_format.fmt.pix.width = caps.width;
 	if (caps.height)
@@ -1007,14 +1025,17 @@ static int set_caps(const char *devicename, const char *capsstring)
 	if (caps.fourcc)
 		vid_format.fmt.pix.pixelformat = caps.fourcc;
 
+    // 使用 ioctl 设置新的视频格式。如果失败，打印错误并跳到末尾。
 	if (ioctl(fd, VIDIOC_S_FMT, &vid_format) == -1) {
 		perror("unable to set requested format");
 		goto done;
 	}
 
+    // 设置控制项以保持格式。
 	set_control_i(fd, "keep_format", 1);
 
 	/* finally, try setting the fps */
+    // 如果有帧率参数，尝试设置帧率。如果成功，设置 sustain_framerate 控制项。
 	if (caps.fps_num && caps.fps_denom) {
 		char fps[100];
 		int didit;

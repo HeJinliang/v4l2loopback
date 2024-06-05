@@ -156,11 +156,12 @@ typedef unsigned __poll_t;
 #endif
 
 /* module parameters */
-static int debug = 0;
+static int debug = 3;
 module_param(debug, int, S_IRUGO | S_IWUSR);
 MODULE_PARM_DESC(debug, "debugging level (higher values == more verbose)");
 
-#define V4L2LOOPBACK_DEFAULT_MAX_BUFFERS 2
+// buffer数量需要将最大值由 2 改成 4，否则 HAL层 查询Camera配置时，由于请求的buffer数量小于4而报查询失败  在 ExternalCameraDeviceSession.cpp 里的 if (req_buffers.count < v4lBufferCount)
+#define V4L2LOOPBACK_DEFAULT_MAX_BUFFERS 4
 static int max_buffers = V4L2LOOPBACK_DEFAULT_MAX_BUFFERS;
 module_param(max_buffers, int, S_IRUGO);
 MODULE_PARM_DESC(max_buffers,
@@ -183,11 +184,15 @@ MODULE_PARM_DESC(
 	"how many users can open the loopback device [DEFAULT: " __stringify(
 		V4L2LOOPBACK_DEFAULT_MAX_OPENERS) "]");
 
+// insmod 表示虚拟Camera的数量
 static int devices = -1;
+// 通过module_param_array宏 来接受通过指令赋值，eg: insmod v4l2loopback.ko devices=4
 module_param(devices, int, 0);
 MODULE_PARM_DESC(devices, "how many devices should be created");
 
+// 定义一个大小为MAX_DEVICES的int数组 video_nr，元素初始值都设置为-1，表示要新增的虚拟Camera 的设备号
 static int video_nr[MAX_DEVICES] = { [0 ...(MAX_DEVICES - 1)] = -1 };
+// video_nr 使用 module_param_array宏 接受通过指令赋值，eg：insmod v4l2loopback.ko video_nr=2,3,5
 module_param_array(video_nr, int, NULL, 0444);
 MODULE_PARM_DESC(video_nr,
 		 "video device numbers (-1=auto, 0=/dev/video0, etc.)");
@@ -253,7 +258,7 @@ static const struct v4l2_ctrl_config v4l2loopback_ctrl_keepformat = {
 	.min	= 0,
 	.max	= 1,
 	.step	= 1,
-	.def	= 0,
+	.def	= 1,
 	// clang-format on
 };
 static const struct v4l2_ctrl_config v4l2loopback_ctrl_sustainframerate = {
@@ -345,8 +350,10 @@ struct v4l2_loopback_device {
 
 	/* timeout stuff */
 	unsigned long timeout_jiffies; /* CID_TIMEOUT; 0 means disabled */
+	// 用于控制v4l2设备的 I/O 超时行为。当超时发生时，将会把 timeout_image 写入到设备中。
 	int timeout_image_io; /* CID_TIMEOUT_IMAGE_IO; next opener will
 			       * read/write to timeout_image */
+	// 一个指向超时图像数据的指针。当超时发生时，将会把这个图像数据写入到设备中。
 	u8 *timeout_image; /* copy of it will be captured when timeout passes */
 	struct v4l2l_buffer timeout_image_buffer;
 	struct timer_list timeout_timer;
@@ -355,6 +362,8 @@ struct v4l2_loopback_device {
 	/* sync stuff */
 	atomic_t open_count;
 
+	// 用于跟踪打开设备并协商格式的写入者数量。它表示设备是否准备好进行捕获操作。
+	// 当有写入者打开设备并成功协商格式时，ready_for_capture的值会相应地增加, 通过检查ready_for_capture的值，可以确定设备是否已经准备好进行捕获操作。
 	int ready_for_capture; /* set to the number of writers that opened the
                                 * device and negotiated format. */
 	int ready_for_output; /* set to true when no writer is currently attached
@@ -426,6 +435,13 @@ struct v4l2l_format {
 /* the format is fixated if we
    - have writers (ready_for_capture>0)
    - and/or have readers (active_readers>0)
+*/
+/**
+ * 用于判断一个 V4L2 loopback 设备是否固定了其格式
+ * 判断三个条件，其中任何一个为真，都认为设备的格式是固定的
+ * 		1、ready_for_capture > 0	有写入者，设备的格式就不能改变。
+ * 		2、active_readers > 0		有读取者，设备的格式就不能改变。
+ * 		3、keep_format				设置格式一致保持，设备的格式就不能改变。
 */
 #define V4L2LOOPBACK_IS_FIXED_FMT(device)                               \
 	(device->ready_for_capture > 0 || device->active_readers > 0 || \
@@ -664,12 +680,17 @@ static ssize_t attr_show_format(struct device *cd,
 				struct device_attribute *attr, char *buf)
 {
 	/* gets the current format as "FOURCC:WxH@f/s", e.g. "YUYV:320x240@1000/30" */
+
+    // 通过通用设备指针，获取 v4l2_loopback_device 指针
 	struct v4l2_loopback_device *dev = v4l2loopback_cd2dev(cd);
+    dprintk("v4l2loopback attr_show_format name:%s \n", dev->vdev->name);
 	const struct v4l2_fract *tpf;
 	char buf4cc[5], buf_fps[32];
 
 	if (!dev || !V4L2LOOPBACK_IS_FIXED_FMT(dev))
 		return 0;
+
+    // 获取帧率信息
 	tpf = &dev->capture_param.timeperframe;
 
 	fourcc2str(dev->pix_format.pixelformat, buf4cc);
@@ -679,8 +700,12 @@ static ssize_t attr_show_format(struct device *cd,
 	else
 		snprintf(buf_fps, sizeof(buf_fps), "%d/%d", tpf->denominator,
 			 tpf->numerator);
-	return sprintf(buf, "%4s:%dx%d@%s\n", buf4cc, dev->pix_format.width,
+    int num = sprintf(buf, "%4s:%dx%d@%s\n", buf4cc, dev->pix_format.width,
 		       dev->pix_format.height, buf_fps);
+    // 将buf打印出来
+    dprintk("v4l2loopback attr_show_format buf:%s \n", buf);
+
+	return num;
 }
 
 static ssize_t attr_store_format(struct device *cd,
@@ -688,7 +713,8 @@ static ssize_t attr_store_format(struct device *cd,
 				 size_t len)
 {
 	struct v4l2_loopback_device *dev = v4l2loopback_cd2dev(cd);
-	int fps_num = 0, fps_den = 1;
+    dprintk("v4l2loopback attr_store_format name:%s \n", dev->vdev->name);
+    int fps_num = 0, fps_den = 1;
 
 	if (!dev)
 		return -ENODEV;
@@ -705,6 +731,9 @@ static ssize_t attr_store_format(struct device *cd,
 	return -EINVAL;
 }
 
+// attr_show_format 当用户空间程序尝试读取 /sys/devices/virtual/video4linux/video**/format 下的数据，此函数会被调用
+//                      例如 cat /sys/devices/virtual/video4linux/video1/format  , cat到的数据其实就是 attr_show_format 函数的返回值
+// attr_store_format 设置 format 这个属性时被调用
 static DEVICE_ATTR(format, S_IRUGO | S_IWUSR, attr_show_format,
 		   attr_store_format);
 
@@ -793,6 +822,11 @@ static void v4l2loopback_remove_sysfs(struct video_device *vdev)
 	}
 }
 
+
+/**
+ * Linux 系统的 /sys 文件系统中为一个 V4L2 (Video4Linux2) 设备创建一些特定的 sysfs 属性
+ * @param vdev
+ */
 static void v4l2loopback_create_sysfs(struct video_device *vdev)
 {
 	int res = 0;
@@ -1045,6 +1079,13 @@ static int vidioc_enum_frameintervals(struct file *file, void *fh,
 /* returns device formats
  * called on VIDIOC_ENUM_FMT, with v4l2_buf_type set to V4L2_BUF_TYPE_VIDEO_CAPTURE
  */
+/**
+ * 枚举（Enum）视频格式（Format）的函数，专用于视频捕获（Capture）操作。
+ * 在 应用层发送ioctl指令 VIDIOC_ENUM_FMT 时，并且v4l2_buf_type设置为V4L2_BUF_TYPE_VIDEO_CAPTURE时，此函数会被调用。
+ * 功能：根据设备是否支持固定格式来返回相应的格式描述和像素格式。
+ * 		如果设备支持固定格式，那么只返回一种格式；
+ * 		如果设备不支持固定格式，则返回参数无效的错误
+*/
 static int vidioc_enum_fmt_cap(struct file *file, void *fh,
 			       struct v4l2_fmtdesc *f)
 {
@@ -1052,12 +1093,18 @@ static int vidioc_enum_fmt_cap(struct file *file, void *fh,
 	const struct v4l2l_format *fmt;
 	MARK();
 
+	// 1. 获取 v4l2_loopback_device 指针
 	dev = v4l2loopback_getdevice(file);
 
 	if (f->index)
 		return -EINVAL;
+	// 2. 检查设备是否支持固定的格式 ， 如果支持固定格式，那么只返回一种格式
+
+    // 打印 dev->keep_format
+    dprintk("v4l2loopback vidioc_enum_fmt_cap dev->keep_format:%d \n", dev->keep_format);
 
 	if (V4L2LOOPBACK_IS_FIXED_FMT(dev)) {
+        MARK();
 		/* format has been fixed, so only one single format is supported */
 		const __u32 format = dev->pix_format.pixelformat;
 
@@ -1121,15 +1168,25 @@ static int vidioc_try_fmt_cap(struct file *file, void *priv,
  * current one, but it is possible to set subregions of input TODO(vasaka)
  * called on VIDIOC_S_FMT, with v4l2_buf_type set to V4L2_BUF_TYPE_VIDEO_CAPTURE
  */
+/**
+ *  设置（Set）视频格式（Format）的函数，专用于视频捕获（Capture）操作。
+ * @param file  代表与设备文件相关联的内核文件结构的指针。
+ * @param priv  指向与当前打开的文件实例关联的私有数据
+ * @param fmt   包含要设置的视频格式信息的结构体。
+ * @return
+ */
 static int vidioc_s_fmt_cap(struct file *file, void *priv,
 			    struct v4l2_format *fmt)
 {
 	int ret;
 	struct v4l2_loopback_device *dev = v4l2loopback_getdevice(file);
+    // 检查格式类型是否为视频捕获类型。如果不是，返回 -EINVAL 错误。
 	if (!V4L2_TYPE_IS_CAPTURE(fmt->type))
 		return -EINVAL;
+    // 尝试设置视频格式。函数 'inner_try_setfmt' 检查格式的可行性。
 	ret = inner_try_setfmt(file, fmt);
 	if (!ret) {
+        // 更新设备的像素格式
 		dev->pix_format = fmt->fmt.pix;
 	}
 	return ret;
@@ -1231,6 +1288,13 @@ static int vidioc_try_fmt_out(struct file *file, void *priv,
  * read/write IO
  * called on VIDIOC_S_FMT with v4l2_buf_type set to V4L2_BUF_TYPE_VIDEO_OUTPUT
  */
+/**
+ * 设置视频输出格式
+ * @param file  代表与设备文件相关联的内核文件结构的指针。
+ * @param priv  指向与当前打开的文件实例关联的私有数据。
+ * @param fmt   包含要设置的视频格式信息的结构体。
+ * @return
+ */
 static int vidioc_s_fmt_out(struct file *file, void *priv,
 			    struct v4l2_format *fmt)
 {
@@ -1238,13 +1302,17 @@ static int vidioc_s_fmt_out(struct file *file, void *priv,
 	int ret;
 	char buf[5];
 	buf[4] = 0;
+    // 检查传入的格式是否是视频输出类型。如果不是，函数返回 -EINVAL（无效参数）。
 	if (!V4L2_TYPE_IS_OUTPUT(fmt->type))
 		return -EINVAL;
+    // 获取设备实例
 	dev = v4l2loopback_getdevice(file);
-
+    // 尝试设置视频格式。这个内部函数可能会检查格式的合理性和兼容性。
 	ret = inner_try_setfmt(file, fmt);
 	if (!ret) {
+        // 更新设备的像素格式 dev->pix_format 为新的格式。
 		dev->pix_format = fmt->fmt.pix;
+        // 设置像素格式的 sizeimage 字段是否有效。
 		dev->pix_format_has_valid_sizeimage =
 			v4l2l_pix_format_has_valid_sizeimage(fmt);
 		dprintk("s_fmt_out(%d) %d...%d\n", ret, dev->ready_for_capture,
@@ -1252,6 +1320,7 @@ static int vidioc_s_fmt_out(struct file *file, void *priv,
 		dprintk("outFOURCC=%s\n",
 			fourcc2str(dev->pix_format.pixelformat, buf));
 
+        // 如果设备还未准备好捕获，函数将计算缓冲区大小，并可能调用 allocate_buffers 来分配必要的缓冲区。
 		if (!dev->ready_for_capture) {
 			dev->buffer_size =
 				PAGE_ALIGN(dev->pix_format.sizeimage);
@@ -1390,6 +1459,7 @@ static int v4l2loopback_set_ctrl(struct v4l2_loopback_device *dev, u32 id,
 		if (val < 0 || val > 1)
 			return -EINVAL;
 		dev->keep_format = val;
+        dprintk("v4l2loopback v4l2loopback_set_ctrl dev->keep_format:%d \n", dev->keep_format);
 		try_free_buffers(
 			dev); /* will only free buffers if !keep_format */
 		break;
@@ -1559,6 +1629,9 @@ static int vidioc_s_input(struct file *file, void *fh, unsigned int i)
  * only mmap streaming supported
  * called on VIDIOC_REQBUFS
  */
+/**
+ * 处理应用程序的缓冲区请求，分配一定数量的缓冲区
+*/
 static int vidioc_reqbufs(struct file *file, void *fh,
 			  struct v4l2_requestbuffers *b)
 {
@@ -1567,12 +1640,14 @@ static int vidioc_reqbufs(struct file *file, void *fh,
 	int i;
 	MARK();
 
+	// 获取设备和打开者的信息
 	dev = v4l2loopback_getdevice(file);
 	opener = fh_to_opener(fh);
 
 	dprintk("reqbufs: %d\t%d=%d\n", b->memory, b->count,
 		dev->buffers_number);
 
+	// 如果设置了超时图像IO，只支持MMAP内存类型，缓冲区数量设置为2
 	if (opener->timeout_image_io) {
 		dev->timeout_image_io = 0;
 		if (b->memory != V4L2_MEMORY_MMAP)
@@ -1581,23 +1656,28 @@ static int vidioc_reqbufs(struct file *file, void *fh,
 		return 0;
 	}
 
+	// 如果设备不准备好输出，返回EBUSY
 	if (V4L2_TYPE_IS_OUTPUT(b->type) && (!dev->ready_for_output)) {
 		return -EBUSY;
 	}
 
+	// 初始化缓冲区
 	init_buffers(dev);
 	switch (b->memory) {
 	case V4L2_MEMORY_MMAP:
 		/* do nothing here, buffers are always allocated */
+		// 如果请求的缓冲区数量小于1或设备的缓冲区数量小于1，直接返回
 		if (b->count < 1 || dev->buffers_number < 1)
 			return 0;
 
+		// 如果请求的缓冲区数量大于设备的缓冲区数量，将请求的缓冲区数量设置为设备的缓冲区数量
 		if (b->count > dev->buffers_number)
 			b->count = dev->buffers_number;
 
 		/* make sure that outbufs_list contains buffers from 0 to used_buffers-1
 		 * actually, it will have been already populated via v4l2_loopback_init()
 		 * at this point */
+		// 如果outbufs_list为空，将设备的缓冲区添加到outbufs_list
 		if (list_empty(&dev->outbufs_list)) {
 			for (i = 0; i < dev->used_buffers; ++i)
 				list_add_tail(&dev->buffers[i].list_head,
@@ -1606,6 +1686,7 @@ static int vidioc_reqbufs(struct file *file, void *fh,
 
 		/* also, if dev->used_buffers is going to be decreased, we should remove
 		 * out-of-range buffers from outbufs_list, and fix bufpos2index mapping */
+		// 如果请求的缓冲区数量小于设备使用的缓冲区数量，需要从outbufs_list中删除超出范围的缓冲区，并修复bufpos2index映射
 		if (b->count < dev->used_buffers) {
 			struct v4l2l_buffer *pos, *n;
 
@@ -1617,7 +1698,8 @@ static int vidioc_reqbufs(struct file *file, void *fh,
 
 			/* after we update dev->used_buffers, buffers in outbufs_list will
 			 * correspond to dev->write_position + [0;b->count-1] range */
-			i = v4l2l_mod64(dev->write_position, b->count);
+            // 更新bufpos2index映射
+            i = v4l2l_mod64(dev->write_position, b->count);
 			list_for_each_entry(pos, &dev->outbufs_list,
 					    list_head) {
 				dev->bufpos2index[i % b->count] =
@@ -1626,6 +1708,7 @@ static int vidioc_reqbufs(struct file *file, void *fh,
 			}
 		}
 
+		// 更新打开者和设备的缓冲区数量
 		opener->buffers_number = b->count;
 		if (opener->buffers_number < dev->used_buffers)
 			dev->used_buffers = opener->buffers_number;
@@ -1640,6 +1723,11 @@ static int vidioc_reqbufs(struct file *file, void *fh,
  * but map them in our inner buffers
  * called on VIDIOC_QUERYBUF
  */
+/**
+ * 查询缓冲区的状态
+ * 通过 "VIDIOC_QUERYBUF" ioctl命令，应用程序可以查询缓冲区的状态。
+ * 包括检查缓冲区的类型和索引，返回请求的缓冲区的信息，以及设置返回的缓冲区的标志。
+*/
 static int vidioc_querybuf(struct file *file, void *fh, struct v4l2_buffer *b)
 {
 	enum v4l2_buf_type type;
@@ -1649,23 +1737,30 @@ static int vidioc_querybuf(struct file *file, void *fh, struct v4l2_buffer *b)
 
 	MARK();
 
+	// 获取缓冲区的类型和索引
 	type = b->type;
 	index = b->index;
+	// 获取设备和打开者的信息
 	dev = v4l2loopback_getdevice(file);
 	opener = fh_to_opener(fh);
 
+	// 检查缓冲区的类型是否正确
 	if ((b->type != V4L2_BUF_TYPE_VIDEO_CAPTURE) &&
 	    (b->type != V4L2_BUF_TYPE_VIDEO_OUTPUT)) {
 		return -EINVAL;
 	}
+	// 检查缓冲区的索引是否超过了最大值
 	if (b->index > max_buffers)
 		return -EINVAL;
 
+	// 如果打开者使用了超时图像IO，那么返回超时图像缓冲区的信息
+    // 否则返回请求的缓冲区的信息
 	if (opener->timeout_image_io)
 		*b = dev->timeout_image_buffer.buffer;
 	else
 		*b = dev->buffers[b->index % dev->used_buffers].buffer;
 
+	// 设置返回的缓冲区的类型和索引
 	b->type = type;
 	b->index = index;
 	dprintkrw("buffer type: %d (of %d with size=%ld)\n", b->memory,
@@ -1673,7 +1768,10 @@ static int vidioc_querybuf(struct file *file, void *fh, struct v4l2_buffer *b)
 
 	/*  Hopefully fix 'DQBUF return bad index if queue bigger then 2 for capture'
             https://github.com/umlaeute/v4l2loopback/issues/60 */
+
+	// 清除V4L2_BUF_FLAG_DONE标志，表示这个缓冲区还没有完成
 	b->flags &= ~V4L2_BUF_FLAG_DONE;
+	// 设置返回的缓冲区的标志为V4L2_BUF_FLAG_QUEUED，表示这个缓冲区已经被放入队列
 	b->flags |= V4L2_BUF_FLAG_QUEUED;
 
 	return 0;
@@ -1702,6 +1800,11 @@ static void buffer_written(struct v4l2_loopback_device *dev,
 /* put buffer to queue
  * called on VIDIOC_QBUF
  */
+/**
+ * 处理应用程序的缓冲区入队请求
+ * 通过 "VIDIOC_QBUF" ioctl命令，应用程序可以将缓冲区入队
+ * 包括检查缓冲区的索引，获取请求的缓冲区的信息，以及根据缓冲区的类型进行不同的处理。
+*/
 static int vidioc_qbuf(struct file *file, void *fh, struct v4l2_buffer *buf)
 {
 	struct v4l2_loopback_device *dev;
@@ -1709,17 +1812,24 @@ static int vidioc_qbuf(struct file *file, void *fh, struct v4l2_buffer *buf)
 	struct v4l2l_buffer *b;
 	int index;
 
+    MARK();
+
+	// 获取设备和打开者的信息
 	dev = v4l2loopback_getdevice(file);
 	opener = fh_to_opener(fh);
 
+	// 检查缓冲区的索引是否超过了最大值
 	if (buf->index > max_buffers)
 		return -EINVAL;
+	// 如果打开者使用了超时图像IO，那么直接返回
 	if (opener->timeout_image_io)
 		return 0;
 
+	// 获取请求的缓冲区的信息
 	index = buf->index % dev->used_buffers;
 	b = &dev->buffers[index];
 
+	// 根据缓冲区的类型进行不同的处理
 	switch (buf->type) {
 	case V4L2_BUF_TYPE_VIDEO_CAPTURE:
 		dprintkrw(
@@ -1728,6 +1838,7 @@ static int vidioc_qbuf(struct file *file, void *fh, struct v4l2_buffer *buf)
 			buf->length, buf->flags, buf->field,
 			(long long)buf->timestamp.tv_sec,
 			(long int)buf->timestamp.tv_usec, buf->sequence);
+		// 如果是捕获类型的缓冲区，那么将其设置为已入队
 		set_queued(b);
 		return 0;
 	case V4L2_BUF_TYPE_VIDEO_OUTPUT:
@@ -1737,6 +1848,7 @@ static int vidioc_qbuf(struct file *file, void *fh, struct v4l2_buffer *buf)
 			buf->length, buf->flags, buf->field,
 			(long long)buf->timestamp.tv_sec,
 			(long int)buf->timestamp.tv_usec, buf->sequence);
+		// 如果是输出类型的缓冲区，那么进行一些处理，包括设置时间戳，检查和设置使用的字节数，将其设置为已完成，并唤醒所有等待读事件的进程
 		if ((!(b->buffer.flags & V4L2_BUF_FLAG_TIMESTAMP_COPY)) &&
 		    (buf->timestamp.tv_sec == 0 && buf->timestamp.tv_usec == 0))
 			v4l2l_get_timestamp(&b->buffer);
@@ -1842,6 +1954,10 @@ static int get_capture_buffer(struct file *file)
 /* put buffer to dequeue
  * called on VIDIOC_DQBUF
  */
+/**
+ * 从设备中取出一个缓冲区
+ * 当 VIDIOC_DQBUF 命令被调用时，该函数会被触发
+*/
 static int vidioc_dqbuf(struct file *file, void *fh, struct v4l2_buffer *buf)
 {
 	struct v4l2_loopback_device *dev;
@@ -1849,8 +1965,12 @@ static int vidioc_dqbuf(struct file *file, void *fh, struct v4l2_buffer *buf)
 	int index;
 	struct v4l2l_buffer *b;
 
+    MARK();
+
+	// 获取设备和打开者的信息
 	dev = v4l2loopback_getdevice(file);
 	opener = fh_to_opener(fh);
+    // 如果有超时buffer，把超时buffer给出去
 	if (opener->timeout_image_io) {
 		*buf = dev->timeout_image_buffer.buffer;
 		return 0;
@@ -1858,17 +1978,23 @@ static int vidioc_dqbuf(struct file *file, void *fh, struct v4l2_buffer *buf)
 
 	switch (buf->type) {
 	case V4L2_BUF_TYPE_VIDEO_CAPTURE:
+		// 获取缓冲区的 index
 		index = get_capture_buffer(file);
 		if (index < 0)
 			return index;
+
+		// 打印读取位置和index
 		dprintkrw("capture DQBUF pos: %lld index: %d\n",
 			  (long long)(opener->read_position - 1), index);
-		if (!(dev->buffers[index].buffer.flags &
-		      V4L2_BUF_FLAG_MAPPED)) {
-			dprintk("trying to return not mapped buf[%d]\n", index);
-			return -EINVAL;
-		}
+		// 如果缓冲区没有被映射，返回错误, 这里逻辑上层 ExternalCameraDeviceSession 的逻辑冲突，注释掉
+//		if (!(dev->buffers[index].buffer.flags &
+//		      V4L2_BUF_FLAG_MAPPED)) {
+//			dprintk("trying to return not mapped buf[%d]\n", index);
+//			return -EINVAL;
+//		}
+		// 清除缓冲区的标志
 		unset_flags(&dev->buffers[index]);
+		// 返回缓冲区
 		*buf = dev->buffers[index].buffer;
 		dprintkrw(
 			"dqbuf(CAPTURE)#%d: buffer#%d @ %p type=%d bytesused=%d length=%d flags=%x field=%d timestamp=%lld.%06ld sequence=%d\n",
@@ -1886,7 +2012,9 @@ static int vidioc_dqbuf(struct file *file, void *fh, struct v4l2_buffer *buf)
 
 		spin_unlock_bh(&dev->list_lock);
 		dprintkrw("output DQBUF index: %d\n", b->buffer.index);
+		// 清除缓冲区的标志
 		unset_flags(b);
+		// 返回缓冲区
 		*buf = b->buffer;
 		buf->type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
 		dprintkrw(
@@ -1906,6 +2034,13 @@ static int vidioc_dqbuf(struct file *file, void *fh, struct v4l2_buffer *buf)
 /* start streaming
  * called on VIDIOC_STREAMON
  */
+/**
+ * 开始视频流
+ * 当 VIDIOC_STREAMON 命令被调用时，该函数会被触发。
+ * @param file  设备文件的文件结构体指针
+ * @param fh    表示打开的设备文件的文件句柄
+ * @param type  表示视频流的类型
+*/
 static int vidioc_streamon(struct file *file, void *fh, enum v4l2_buf_type type)
 {
 	struct v4l2_loopback_device *dev;
@@ -1915,24 +2050,37 @@ static int vidioc_streamon(struct file *file, void *fh, enum v4l2_buf_type type)
 	dev = v4l2loopback_getdevice(file);
 	opener = fh_to_opener(fh);
 
+	// 根据缓冲区类型进行不同的处理
 	switch (type) {
 	case V4L2_BUF_TYPE_VIDEO_OUTPUT:
+	 	// 如果设备还未准备好捕获视频，则尝试分配缓冲区
 		if (!dev->ready_for_capture) {
 			int ret = allocate_buffers(dev);
+            dprintk("v4l2loopback vidioc_streamon allocate_buffers ret:%d \n", ret);
 			if (ret < 0)
-				return ret;
+				return ret; // 如果分配缓冲区失败，则返回错误码
 		}
-		opener->type = WRITER;
-		dev->ready_for_output = 0;
-		dev->ready_for_capture++;
+		opener->type = WRITER;	// 设置打开的设备文件的类型为写入者
+		dev->ready_for_output = 0;	// 设置设备未准备好输出视频
+		dev->ready_for_capture++;	// 增加设备的捕获准备计数
 		return 0;
 	case V4L2_BUF_TYPE_VIDEO_CAPTURE:
-		if (!dev->ready_for_capture)
-			return -EIO;
-		if (dev->active_readers > 0)
-			return -EBUSY;
-		opener->type = READER;
-		dev->active_readers++;
+		// 如果设备还未准备好捕获视频，则返回错误码
+		if (!dev->ready_for_capture) {
+            // 打印日志
+            dprintk("v4l2loopback vidioc_streamon dev->ready_for_capture:%d \n", dev->ready_for_capture);
+            return -EIO;
+        }
+		// 如果设备已经有活动的读取者，则返回错误码
+		if (dev->active_readers > 0) {
+            // 打印日志
+            dprintk("v4l2loopback vidioc_streamon dev->active_readers:%d \n", dev->active_readers);
+            return -EBUSY;
+        }
+        // 打印出 dev->active_readers
+//        printk("v4l2loopback vidioc_streamon dev->active_readers:%d \n", dev->active_readers);
+		opener->type = READER;	// 设置打开的设备文件的类型为读取者
+		dev->active_readers++;	// 增加设备的活动读取者计数
 		client_usage_queue_event(dev->vdev);
 		return 0;
 	default:
@@ -2046,7 +2194,13 @@ static int vidioc_subscribe_event(struct v4l2_fh *fh,
 	return -EINVAL;
 }
 
-/* file operations */
+/**
+ * @brief 打开虚拟内存区域
+ *
+ * 此函数用于打开给定的虚拟内存区域，并对相关的缓冲区进行操作。
+ *
+ * @param vma 虚拟内存区域结构体指针
+ */
 static void vm_open(struct vm_area_struct *vma)
 {
 	struct v4l2l_buffer *buf;
@@ -2075,6 +2229,13 @@ static struct vm_operations_struct vm_ops = {
 	.close = vm_close,
 };
 
+/**
+ * @brief 	应用程序的内存映射请求 （由用户空间程序执行'mmap'系统调用开始的）
+ * 			包括检查映射的大小和偏移，分配和查找缓冲区，以及将设备内存映射到用户空间。
+ * @param file 		设备文件的文件结构体指针
+ * @param vma 		虚拟内存区域结构体指针
+ * @return int 		返回值
+ */
 static int v4l2_loopback_mmap(struct file *file, struct vm_area_struct *vma)
 {
 	u8 *addr;
@@ -2085,18 +2246,23 @@ static int v4l2_loopback_mmap(struct file *file, struct vm_area_struct *vma)
 	struct v4l2l_buffer *buffer = NULL;
 	MARK();
 
+	// 获取映射的起始地址和大小
 	start = (unsigned long)vma->vm_start;
 	size = (unsigned long)(vma->vm_end - vma->vm_start);
 
+	// 获取设备和打开者的信息
 	dev = v4l2loopback_getdevice(file);
 	opener = fh_to_opener(file->private_data);
 
+	// 检查映射的大小是否超过了缓冲区的大小
 	if (size > dev->buffer_size) {
 		dprintk("userspace tries to mmap too much, fail\n");
 		return -EINVAL;
 	}
+
 	if (opener->timeout_image_io) {
 		/* we are going to map the timeout_image_buffer */
+		// 检查映射的偏移是否超过了缓冲区的范围
 		if ((vma->vm_pgoff << PAGE_SHIFT) !=
 		    dev->buffer_size * MAX_BUFFERS) {
 			dprintk("invalid mmap offset for timeout_image_io mode\n");
@@ -2109,6 +2275,7 @@ static int v4l2_loopback_mmap(struct file *file, struct vm_area_struct *vma)
 	}
 
 	/* FIXXXXXME: allocation should not happen here! */
+	// 如果设备的图像缓冲区还没有分配，那么在这里分配
 	if (NULL == dev->image)
 		if (allocate_buffers(dev) < 0)
 			return -EINVAL;
@@ -2117,6 +2284,7 @@ static int v4l2_loopback_mmap(struct file *file, struct vm_area_struct *vma)
 		buffer = &dev->timeout_image_buffer;
 		addr = dev->timeout_image;
 	} else {
+		// 根据映射的偏移找到对应的缓冲区和地址
 		int i;
 		for (i = 0; i < dev->buffers_number; ++i) {
 			buffer = &dev->buffers[i];
@@ -2131,6 +2299,7 @@ static int v4l2_loopback_mmap(struct file *file, struct vm_area_struct *vma)
 		addr = dev->image + (vma->vm_pgoff << PAGE_SHIFT);
 	}
 
+	// 将设备内存映射到用户空间
 	while (size > 0) {
 		struct page *page;
 
@@ -2144,9 +2313,11 @@ static int v4l2_loopback_mmap(struct file *file, struct vm_area_struct *vma)
 		size -= PAGE_SIZE;
 	}
 
+	// 设置vma的操作函数和私有数据
 	vma->vm_ops = &vm_ops;
 	vma->vm_private_data = buffer;
 
+	// 打开虚拟内存区域
 	vm_open(vma);
 
 	MARK();
@@ -2200,46 +2371,82 @@ static unsigned int v4l2_loopback_poll(struct file *file,
 
 /* do not want to limit device opens, it can be as many readers as user want,
  * writers are limited by means of setting writer field */
+/**
+ *  打开设备的函数
+ * 这个函数会在用户程序尝试打开设备时被 V4L2 框架调用。
+ * 例如，当用户程序调用 open("/dev/videoN", O_RDWR) 时，
+ * 		如果 /dev/videoN 是一个 V4L2 loopback 设备，
+ * 		那么 V4L2 框架就会调用这个函数。
+ * @param file	文件指针
+*/
 static int v4l2_loopback_open(struct file *file)
 {
+	// 1. 获取到要打开的设备 v4l2_loopback_device dev
 	struct v4l2_loopback_device *dev;
 	struct v4l2_loopback_opener *opener;
 	MARK();
 	dev = v4l2loopback_getdevice(file);
-	if (dev->open_count.counter >= dev->max_openers)
-		return -EBUSY;
+
+	// 2. 检查设备的 open_count 是否已经达到了 max_openers 的限制。如果达到了，那么函数返回 -EBUSY 错误代码，表示设备忙。
+	if (dev->open_count.counter >= dev->max_openers) {
+        // 打印出  dev->open_count.counter 和 dev->max_openers
+        dprintk("v4l2loopback v4l2_loopback_open dev->open_count.counter:%d dev->max_openers:%d \n", dev->open_count.counter, dev->max_openers);
+        return -EBUSY;
+    }
 	/* kfree on close */
+	// 3. 为设备分配一个 v4l2_loopback_opener 结构体，包含了打开者的信息，比如超时时间等。
 	opener = kzalloc(sizeof(*opener), GFP_KERNEL);
-	if (opener == NULL)
-		return -ENOMEM;
+	if (opener == NULL) {
+        dprintk("v4l2loopback v4l2_loopback_open kzalloc failed \n");
+        return -ENOMEM;
+    }
 
+	// 4. 设备打开计数器加一
 	atomic_inc(&dev->open_count);
+    // 打印 dev->open_count.counter
+    dprintk("v4l2loopback v4l2_loopback_open atomic_inc dev->open_count.counter:%d \n", dev->open_count.counter);
 
+	// 5. 如果设备启用了 timeout_image_io，那么函数会尝试分配一个超时图像
+	// hjl 这个要重点关注，可能是默认图的位置
 	opener->timeout_image_io = dev->timeout_image_io;
 	if (opener->timeout_image_io) {
+		// 尝试分配一个超时图像
 		int r = allocate_timeout_image(dev);
 
+		// 如果分配失败，减少设备的 open_count，释放刚刚分配的 v4l2_loopback_opener 结构体
 		if (r < 0) {
 			dprintk("timeout image allocation failed\n");
 
 			atomic_dec(&dev->open_count);
+            dprintk("v4l2loopback v4l2_loopback_open atomic_dec 000 dev->open_count.counter:%d \n", dev->open_count.counter);
 
-			kfree(opener);
+
+            kfree(opener);
 			return r;
 		}
 	}
-
+	// v4l2_fh 结构体是用于表示一个打开的设备实例的。
+	// 每当一个用户程序打开一个设备，就会创建一个新的 v4l2_fh 实例。
+	// 6. v4l2_fh_init 用来初始化一个 v4l2_fh 实例，
 	v4l2_fh_init(&opener->fh, video_devdata(file));
 	file->private_data = &opener->fh;
 
+	// 7. v4l2_fh_add 用来将这个 v4l2_fh 实例添加到设备的打开者列表中，这样设备就可以知道有哪些程序打开了它。
 	v4l2_fh_add(&opener->fh);
 	dprintk("opened dev:%p with image:%p\n", dev, dev ? dev->image : NULL);
 	MARK();
 	return 0;
 }
 
+/**
+ * @brief 	关闭设备的函数
+ * 			这个函数会在用户程序尝试关闭设备时被 V4L2 框架调用。
+ * @param file
+ * @return int
+ */
 static int v4l2_loopback_close(struct file *file)
 {
+	// 1. 获取到要关闭的设备 v4l2_loopback_device dev 和 v4l2_loopback_opener opener
 	struct v4l2_loopback_opener *opener;
 	struct v4l2_loopback_device *dev;
 	int is_writer = 0, is_reader = 0;
@@ -2248,24 +2455,38 @@ static int v4l2_loopback_close(struct file *file)
 	opener = fh_to_opener(file->private_data);
 	dev = v4l2loopback_getdevice(file);
 
+	// 2. 标记打开者是读者还是写者
 	if (WRITER == opener->type)
 		is_writer = 1;
 	if (READER == opener->type)
 		is_reader = 1;
-
+	// 3. 从设备的打开者列表中删除这个打开者
 	atomic_dec(&dev->open_count);
+    dprintk("v4l2loopback v4l2_loopback_open atomic_dec dev->open_count.counter:%d \n", dev->open_count.counter);
+
+
+    // 4. 如果设备的 open_count 计数器为 0，那么说明没有程序打开这个设备了，那么就可以释放设备的内存了（删除两个定时器）
 	if (dev->open_count.counter == 0) {
+		// dev->sustain_timer是一个持续定时器，它用于保持设备处于打开状态的时间。当设备的打开计数器（dev->open_count.counter）为0时，表示设备没有被打开，这时就需要停止持续定时器的计时。
 		del_timer_sync(&dev->sustain_timer);
+		//dev->timeout_timer是一个超时定时器，它用于在设备打开一段时间后自动关闭设备。当设备的打开计数器为0时，表示设备没有被打开，这时就需要停止超时定时器的计时。
 		del_timer_sync(&dev->timeout_timer);
 	}
+	//	5.  尝试释放设备的缓冲区
 	try_free_buffers(dev);
 
+	// 6. 从设备的打开者列表中删除 opener->fh，并退出 opener->fh
 	v4l2_fh_del(&opener->fh);
 	v4l2_fh_exit(&opener->fh);
 
+	// 释放 opener
 	kfree(opener);
+
+	// 如果打开者是为了写入数据，则设备准备好输出
 	if (is_writer)
 		dev->ready_for_output = 1;
+
+	// 如果打开者是为了读取数据，设备的活动读者数量-1, 并且会在设备的客户端使用队列中触发一个事件。
 	if (is_reader) {
 		dev->active_readers--;
 		client_usage_queue_event(dev->vdev);
@@ -2358,7 +2579,7 @@ static ssize_t v4l2_loopback_write(struct file *file, const char __user *buf,
 	b->sequence = dev->write_position;
 	buffer_written(dev, &dev->buffers[write_index]);
 	wake_up_all(&dev->read_event);
-	dprintkrw("leave v4l2_loopback_write()\n");
+	dprintkrw("leave v4l2_loopback_write() count:%d\n", count);
 	return count;
 }
 
@@ -2600,36 +2821,52 @@ static void timeout_timer_clb(unsigned long nr)
 							 (conf->confmember)) : \
 		 default_value)
 
+
+/**
+ * 添加一个虚拟视频设备
+ * @param conf
+ * @param ret_nr
+ * @return
+ */
 static int v4l2_loopback_add(struct v4l2_loopback_config *conf, int *ret_nr)
 {
+    // 存储新创建设备信息的指针
 	struct v4l2_loopback_device *dev;
+    // 视频控制处理器
 	struct v4l2_ctrl_handler *hdl;
+    // 存储设备号？
 	struct v4l2loopback_private *vdev_priv = NULL;
-
+    // 初始化为内存不足
 	int err = -ENOMEM;
-
+    // 默认宽高 640*480
 	u32 _width = V4L2LOOPBACK_SIZE_DEFAULT_WIDTH;
 	u32 _height = V4L2LOOPBACK_SIZE_DEFAULT_HEIGHT;
 
+    // 这里通过宏判断，入参 conf 里的 min_width 和 宏 V4L2LOOPBACK_SIZE_MIN_WIDTH，取二者较大者赋值给 _min_width
 	u32 _min_width = DEFAULT_FROM_CONF(min_width,
 					   < V4L2LOOPBACK_SIZE_MIN_WIDTH,
 					   V4L2LOOPBACK_SIZE_MIN_WIDTH);
 	u32 _min_height = DEFAULT_FROM_CONF(min_height,
 					    < V4L2LOOPBACK_SIZE_MIN_HEIGHT,
 					    V4L2LOOPBACK_SIZE_MIN_HEIGHT);
+    // 通过宏判断，入参 conf 里的 max_width 和 上面的 _min_width，取二者较大值给 _max_width
 	u32 _max_width = DEFAULT_FROM_CONF(max_width, < _min_width, max_width);
 	u32 _max_height =
 		DEFAULT_FROM_CONF(max_height, < _min_height, max_height);
+    // 根据配置，宣告所有能力
 	bool _announce_all_caps = (conf && conf->announce_all_caps >= 0) ?
 					  (conf->announce_all_caps) :
 					  V4L2LOOPBACK_DEFAULT_EXCLUSIVECAPS;
+    // 设置缓冲区数量最大值，默认2 , DEFAULT_FROM_CONF 这个宏根据第二个参数值，true：采用第三个参数，false: 采用第一个参数
 	int _max_buffers = DEFAULT_FROM_CONF(max_buffers, <= 0, max_buffers);
+    // 设置最大打开这数量，默认10
 	int _max_openers = DEFAULT_FROM_CONF(max_openers, <= 0, max_openers);
 
 	int nr = -1;
 
 	_announce_all_caps = (!!_announce_all_caps);
 
+    // 这里 output_nr 和 capture_nr 都取值自 conf->output_nr，加载模块时跟参 video_nr 后如果有值，则conf->output_nr就是这个值，否则是-1
 	if (conf) {
 		const int output_nr = conf->output_nr;
 #ifdef SPLIT_DEVICES
@@ -2655,15 +2892,22 @@ static int v4l2_loopback_add(struct v4l2_loopback_config *conf, int *ret_nr)
 		}
 	}
 
-	if (idr_find(&v4l2loopback_index_idr, nr))
-		return -EEXIST;
+    // 检查是否已有设备使用指定'nr'(设备号)，如果是，则返回 EEXIST 错误，表示设备已存在。
+	if (idr_find(&v4l2loopback_index_idr, nr)) {
+        dprintk("creating v4l2loopback-device fail  haved nr #%d\n", nr);
+        return -EEXIST;
+    }
 
 	dprintk("creating v4l2loopback-device #%d\n", nr);
+    // 为 dev 分配内存
 	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
 	if (!dev)
 		return -ENOMEM;
 
+	dprintk("creating v4l2loopback-device idr_alloc #%d\n", nr);
+
 	/* allocate id, if @id >= 0, we're requesting that specific id */
+    // 根据 nr 的值，尝试为设备分配一个唯一的标识符（ID）。如果 nr >= 0，则尝试分配特定的ID；否则，自动分配一个ID。
 	if (nr >= 0) {
 		err = idr_alloc(&v4l2loopback_index_idr, dev, nr, nr + 1,
 				GFP_KERNEL);
@@ -2674,7 +2918,9 @@ static int v4l2_loopback_add(struct v4l2_loopback_config *conf, int *ret_nr)
 	}
 	if (err < 0)
 		goto out_free_dev;
-	nr = err;
+    // 将分配好的ID赋值给 nr
+    dprintk("allocation v4l2loopback-device id %d\n", nr);
+    nr = err;
 	err = -ENOMEM;
 
 	if (conf && conf->card_label[0]) {
@@ -2687,23 +2933,25 @@ static int v4l2_loopback_add(struct v4l2_loopback_config *conf, int *ret_nr)
 	snprintf(dev->v4l2_dev.name, sizeof(dev->v4l2_dev.name),
 		 "v4l2loopback-%03d", nr);
 
+    // 注册 v4l2_loopback 设备到 V4L2 框架中。NULL 表示没有父设备。
 	err = v4l2_device_register(NULL, &dev->v4l2_dev);
 	if (err)
 		goto out_free_idr;
 	MARK();
 
+    // 为视频设备分配一个 video_device 结构体。
 	dev->vdev = video_device_alloc();
 	if (dev->vdev == NULL) {
 		err = -ENOMEM;
 		goto out_unregister;
 	}
-
+    // 为视频设备分配私有数据结构体。
 	vdev_priv = kzalloc(sizeof(struct v4l2loopback_private), GFP_KERNEL);
 	if (vdev_priv == NULL) {
 		err = -ENOMEM;
 		goto out_unregister;
 	}
-
+    // 设置视频设备的驱动数据为私有数据结构体。
 	video_set_drvdata(dev->vdev, vdev_priv);
 	if (video_get_drvdata(dev->vdev) == NULL) {
 		err = -ENOMEM;
@@ -2711,33 +2959,44 @@ static int v4l2_loopback_add(struct v4l2_loopback_config *conf, int *ret_nr)
 	}
 
 	MARK();
+
+    // 设置视频设备的名称
 	snprintf(dev->vdev->name, sizeof(dev->vdev->name), "%s",
 		 dev->card_label);
-
+    // 在私有数据结构体中设置设备编号。
 	vdev_priv->device_nr = nr;
-
+    // 初始化视频设备
 	init_vdev(dev->vdev, nr);
 	dev->vdev->v4l2_dev = &dev->v4l2_dev;
+    // 捕获参数
 	init_capture_param(&dev->capture_param);
+    // 设置帧率
 	err = set_timeperframe(dev, &dev->capture_param.timeperframe);
 	if (err)
 		goto out_unregister;
-	dev->keep_format = 0;
-	dev->sustain_framerate = 0;
 
+    // 不保存之前的流的格式？
+	dev->keep_format = 0;
+    // 不保持恒定帧率
+	dev->sustain_framerate = 0;
+    // 设置设备是否宣布其支持的所有功能。这取决于配置变量 _announce_all_caps。
 	dev->announce_all_caps = _announce_all_caps;
 	dev->min_width = _min_width;
 	dev->min_height = _min_height;
 	dev->max_width = _max_width;
 	dev->max_height = _max_height;
+    // 设置可以同时打开设备的最大用户数量
 	dev->max_openers = _max_openers;
+    // 初始化设备的缓冲区数量
 	dev->buffers_number = dev->used_buffers = _max_buffers;
-
+    // 初始化设备的写入位置
 	dev->write_position = 0;
 
 	MARK();
+    // 始化两个自旋锁 dev->lock 和 dev->list_lock。这些锁用于在多线程环境中保护对共享资源的访问
 	spin_lock_init(&dev->lock);
 	spin_lock_init(&dev->list_lock);
+    // 始化输出缓冲区列表 dev->outbufs_list 并为每个已使用的缓冲区添加一个列表项。
 	INIT_LIST_HEAD(&dev->outbufs_list);
 	if (list_empty(&dev->outbufs_list)) {
 		int i;
@@ -2746,14 +3005,18 @@ static int v4l2_loopback_add(struct v4l2_loopback_config *conf, int *ret_nr)
 			list_add_tail(&dev->buffers[i].list_head,
 				      &dev->outbufs_list);
 	}
+    // 清零数组 dev->bufpos2index，用于映射缓冲区位置到其索引
 	memset(dev->bufpos2index, 0, sizeof(dev->bufpos2index));
+    // 设置 dev->open_count 为 0，这是一个原子变量，用于追踪打开设备的次数
 	atomic_set(&dev->open_count, 0);
-	dev->ready_for_capture = 0;
+    // 设置 dev->ready_for_capture 为 0 和 dev->ready_for_output 为 1，用于标记设备的状态。
+	dev->ready_for_capture = 1;
 	dev->ready_for_output = 1;
 
 	dev->buffer_size = 0;
 	dev->image = NULL;
 	dev->imagesize = 0;
+    // 初始化相关的定时器，如 sustain_timer 和 timeout_timer，用于处理持续帧率和超时逻辑。
 #ifdef HAVE_TIMER_SETUP
 	timer_setup(&dev->sustain_timer, sustain_timer_clb, 0);
 	timer_setup(&dev->timeout_timer, timeout_timer_clb, 0);
@@ -2766,6 +3029,7 @@ static int v4l2_loopback_add(struct v4l2_loopback_config *conf, int *ret_nr)
 	dev->timeout_image = NULL;
 	dev->timeout_happened = 0;
 
+    // 初始化 dev->ctrl_handler 控制处理程序并注册自定义控制
 	hdl = &dev->ctrl_handler;
 	err = v4l2_ctrl_handler_init(hdl, 4);
 	if (err)
@@ -2802,6 +3066,26 @@ static int v4l2_loopback_add(struct v4l2_loopback_config *conf, int *ret_nr)
 	dev->pix_format.colorspace =
 		V4L2_COLORSPACE_DEFAULT; /* do we need to set this ? */
 	dev->pix_format.field = V4L2_FIELD_NONE;
+
+	// 打印出当前 v4l2_loopback_device 的设备号
+	dprintk("v4l2loopback video_register_device nr #%d\n", nr);
+
+    // 手动设置buffer格式
+	dev->pix_format.pixelformat = v4l2_fourcc('Y', 'U', '1', '2');
+	dev->pix_format.width = 1920;
+	dev->pix_format.height = 1080;
+	dev->pix_format.sizeimage = dev->pix_format.width * dev->pix_format.height * 3 / 2;
+
+	// 比对 printk("v4l2loopback video_register_device nr #%d\n", nr); 的写法，打印出 dev->pix_format.width dev->pix_format.height dev->pix_format.pixelformat 这三个变量的值
+	dprintk("v4l2loopback width = %d\n", dev->pix_format.width);
+	dprintk("v4l2loopback height = %d\n", dev->pix_format.height);
+	dprintk("v4l2loopback pixelformat = %c%c%c%c\n",
+		(dev->pix_format.pixelformat >> 0) & 0xFF,
+		(dev->pix_format.pixelformat >> 8) & 0xFF,
+		(dev->pix_format.pixelformat >> 16) & 0xFF,
+		(dev->pix_format.pixelformat >> 24) & 0xFF);
+    dprintk("v4l2loopback sizeimage = %d\n", dev->pix_format.sizeimage);
+
 
 	dev->buffer_size = PAGE_ALIGN(dev->pix_format.sizeimage);
 	dprintk("buffer_size = %ld (=%d)\n", dev->buffer_size,
@@ -2842,6 +3126,11 @@ out_free_dev:
 	return err;
 }
 
+/**
+ * @brief 	删除一个虚拟视频设备
+ *
+ * @param dev
+ */
 static void v4l2_loopback_remove(struct v4l2_loopback_device *dev)
 {
 	free_buffers(dev);
@@ -2983,6 +3272,7 @@ static struct miscdevice v4l2loopback_misc = {
 	// clang-format on
 };
 
+// 处理视频设备的各种文件操作, 这些操作在设备文件('/dev/video*')上执行
 static const struct v4l2_file_operations v4l2_loopback_fops = {
 	// clang-format off
 	.owner		= THIS_MODULE,
@@ -3120,6 +3410,7 @@ static int __init v4l2loopback_init_module(void)
 	}
 
 	for (i = 0; i < devices; i++) {
+		dprintk(KERN_INFO "v4l2loopback: output_nr %d\n", video_nr[i]);
 		struct v4l2_loopback_config cfg = {
 			// clang-format off
 			.output_nr		= video_nr[i],

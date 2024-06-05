@@ -36,14 +36,14 @@ fail(char *msg)
 	exit(1);
 }
 
-struct yuv_setup
-process_args(int argc, char **argv)
+struct yuv_setup process_args(int argc, char **argv)
 {
 	prog = argv[0];
 	struct yuv_setup setup;
 	if (argc != 6) {
 		fail("invalid argument");
 	} else {
+        // yuv420_infiniteloop /dev/video21 sdcard/earth_15.yuv 1920 1080 30
 		setup.device = argv[1];
 		setup.file_name = argv[2];
 		setup.frame_width = atoi(argv[3]);
@@ -73,7 +73,13 @@ copy_frames(struct yuv_setup setup, int dev_fd)
 		int read_size = fread(frame, 1, setup.frame_bytes, yuv_file);
 		usleep(1.0f/setup.fps * 1000000.0f);
 		if (read_size == setup.frame_bytes) {
-			write(dev_fd, frame, setup.frame_bytes);
+			int write_size = write(dev_fd, frame, setup.frame_bytes);
+			if (write_size == setup.frame_bytes) {
+                fprintf(stderr, "%s: Frame written successfully: %d bytes\n", prog, write_size);
+			} else {
+                // 打印错误信息
+//                fprintf(stderr, "%s: Failed to write frame: expected %d bytes, but wrote %d bytes\n", prog, setup.frame_bytes, write_size);
+			}
 		} else if (read_size == 0) {
 			fclose(yuv_file);
 			yuv_file = fopen (setup.file_name,"rb");
@@ -111,9 +117,7 @@ open_video(struct yuv_setup setup)
 	return dev_fd;
 }
 
-int
-main(int argc, char **argv)
-{
+int main(int argc, char **argv) {
 	struct yuv_setup loc_setup = process_args(argc, argv);
 	int loc_dev = open_video(loc_setup);
 	copy_frames(loc_setup, loc_dev);
