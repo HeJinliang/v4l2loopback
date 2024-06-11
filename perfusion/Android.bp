@@ -1,9 +1,0 @@
-cc_binary {
-    name: "obs",
-    srcs: ["v4l2_perfusion.c"],
-    shared_libs: ["libcutils", "liblog"],
-    cflags: [
-        "-Wno-unused-parameter",
-        "-D_GNU_SOURCE" // 添加这个标志，这样才可能使用 sys/mman.h 中的 memfd_create 函数
-    ],
-}
